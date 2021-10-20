@@ -5,6 +5,7 @@ package query
 
 import (
 	"context"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -40,6 +41,7 @@ func NewQueryableCreator(logger log.Logger, reg prometheus.Registerer, proxy sto
 	duration := promauto.With(
 		extprom.WrapRegistererWithPrefix("concurrent_selects_", reg),
 	).NewHistogram(gate.DurationHistogramOpts)
+	initMetric(reg)
 
 	return func(deduplicate bool, replicaLabels []string, storeDebugMatchers [][]*labels.Matcher, maxResolutionMillis int64, partialResponse, skipChunks bool) storage.Queryable {
 		return &queryable{
@@ -194,6 +196,9 @@ func aggrsFromFunc(f string) []storepb.Aggr {
 }
 
 func (q *querier) Select(_ bool, hints *storage.SelectHints, ms ...*labels.Matcher) storage.SeriesSet {
+	defer histOfSelectLatency.Observe(float64(time.Since(time.Now()).Milliseconds()))
+	counterOfSelectTimes.Inc()
+
 	if hints == nil {
 		hints = &storage.SelectHints{
 			Start: q.mint,
@@ -256,6 +261,7 @@ func (q *querier) Select(_ bool, hints *storage.SelectHints, ms ...*labels.Match
 }
 
 func (q *querier) selectFn(ctx context.Context, hints *storage.SelectHints, ms ...*labels.Matcher) (storage.SeriesSet, error) {
+
 	sms, err := storepb.PromMatchersToMatchers(ms...)
 	if err != nil {
 		return nil, errors.Wrap(err, "convert matchers")
@@ -278,6 +284,36 @@ func (q *querier) selectFn(ctx context.Context, hints *storage.SelectHints, ms .
 		SkipChunks:              q.skipChunks,
 	}, resp); err != nil {
 		return nil, errors.Wrap(err, "proxy Series()")
+	}
+	{
+		counterOfSelectWarning.Add(float64(len(resp.warnings)))
+		counterOfSelectSeries.Add(float64(len(resp.seriesSet)))
+		bytesTotal := 0
+		for _, item := range resp.seriesSet {
+			counterOfSelectSeriesLabels.Add(float64(len(item.Labels)))
+			counterOfSelectSeriesChunks.Add(float64(len(item.Chunks)))
+			for _, chunk := range item.Chunks {
+				if chunk.Counter != nil && chunk.Counter.Data != nil {
+					bytesTotal += len(chunk.Counter.Data)
+				}
+				if chunk.Max != nil && chunk.Max.Data != nil {
+					bytesTotal += len(chunk.Max.Data)
+				}
+				if chunk.Min != nil && chunk.Min.Data != nil {
+					bytesTotal += len(chunk.Min.Data)
+				}
+				if chunk.Sum != nil && chunk.Sum.Data != nil {
+					bytesTotal += len(chunk.Sum.Data)
+				}
+				if chunk.Count != nil && chunk.Count.Data != nil {
+					bytesTotal += len(chunk.Count.Data)
+				}
+				if chunk.Raw != nil && chunk.Raw.Data != nil {
+					bytesTotal += len(chunk.Raw.Data)
+				}
+			}
+		}
+		counterOfSelectSeriesChunkBytes.Add(float64(bytesTotal))
 	}
 
 	var warns storage.Warnings
@@ -400,4 +436,68 @@ func (q *querier) LabelNames(matchers ...*labels.Matcher) ([]string, storage.War
 func (q *querier) Close() error {
 	q.cancel()
 	return nil
+}
+
+var (
+	counterOfSelectTimes            prometheus.Counter
+	histOfSelectLatency             prometheus.Observer
+	counterOfSelectWarning          prometheus.Counter
+	counterOfSelectSeries           prometheus.Counter
+	counterOfSelectSeriesLabels     prometheus.Counter
+	counterOfSelectSeriesChunks     prometheus.Counter
+	counterOfSelectSeriesChunkBytes prometheus.Counter
+)
+
+func initMetric(reg prometheus.Registerer) {
+	podName := os.Getenv("POD_NAME")
+	podIP := os.Getenv("POD_IP")
+	labels := []string{"container_name", "container_ip"}
+	vec := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "external_select_times_total",
+	}, labels)
+	//prometheus.MustRegister(vec)
+	counterOfSelectTimes = vec.WithLabelValues(podName, podIP)
+
+	hist := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "external_select_latency",
+		Buckets: []float64{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 500, 800, 1000, 2000, 3000, 4000, 5000, 10000},
+	}, labels)
+	//prometheus.MustRegister(hist)
+	histOfSelectLatency = hist.WithLabelValues(podName, podIP)
+	//
+	vecOfSelectWarning := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "external_select_warning_total",
+	}, labels)
+	//prometheus.MustRegister(vec)
+	counterOfSelectWarning = vecOfSelectWarning.WithLabelValues(podName, podIP)
+	//
+	vecOfSelectSeries := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "external_select_series_total",
+	}, labels)
+	counterOfSelectSeries = vecOfSelectSeries.WithLabelValues(podName, podIP)
+	//
+	vecOfSelectSeriesLabels := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "external_select_labels_total",
+	}, labels)
+	counterOfSelectSeriesLabels = vecOfSelectSeriesLabels.WithLabelValues(podName, podIP)
+	//
+	vecOfSelectSeriesChunks := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "external_select_chunks_total",
+	}, labels)
+	counterOfSelectSeriesChunks = vecOfSelectSeriesChunks.WithLabelValues(podName, podIP)
+	//
+	vecOfSelectSeriesChunkBytes := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "external_select_chunks_bytes_total",
+	}, labels)
+	counterOfSelectSeriesChunkBytes = vecOfSelectSeriesChunkBytes.WithLabelValues(podName, podIP)
+	//
+	reg.Register(vec)
+	reg.Register(hist)
+	reg.Register(vecOfSelectWarning)
+	reg.Register(vecOfSelectSeries)
+	reg.Register(vecOfSelectSeriesLabels)
+	reg.Register(vecOfSelectSeriesChunks)
+	reg.Register(vecOfSelectSeriesChunkBytes)
+	//prometheus.MustRegister(vec, hist, vecOfSelectWarning, vecOfSelectSeries, vecOfSelectSeriesLabels,
+	//	vecOfSelectSeriesChunks, vecOfSelectSeriesChunkBytes)
 }
